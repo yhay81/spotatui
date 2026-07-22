@@ -391,10 +391,15 @@ fn is_no_active_device_error(e: &anyhow::Error) -> bool {
 }
 
 /// Handle transient failures from the playback poll (`me/player`) that must not
-/// replace the still-playing UI with the full-screen Error route. Returns `true`
-/// when the error was consumed: a status message was shown, the next poll was
-/// scheduled, and the caller must skip generic error handling.
-fn handle_transient_playback_poll_error(app: &mut App, err_text: &str) -> bool {
+/// replace the still-playing UI with the full-screen Error route. Returns
+/// `Some((status_message, ttl_secs))` when the error was consumed: the next
+/// poll was scheduled and the caller must show the message via the async
+/// `show_status_message` helper (after releasing the app lock) and skip
+/// generic error handling.
+fn handle_transient_playback_poll_error(
+  app: &mut App,
+  err_text: &str,
+) -> Option<(&'static str, u64)> {
   let lowered = err_text.to_lowercase();
 
   // Playback polling is observational: a stale/missing Web API token must
@@ -405,24 +410,22 @@ fn handle_transient_playback_poll_error(app: &mut App, err_text: &str) -> bool {
     || lowered.contains("access token missing")
   {
     app.dispatch(IoEvent::RefreshAuthentication);
-    app.set_status_message(
+    app.instant_since_last_current_playback_poll = Instant::now();
+    return Some((
       "Spotify session expired. Refreshing authentication automatically.",
       5,
-    );
-    app.instant_since_last_current_playback_poll = Instant::now();
-    return true;
+    ));
   }
 
   if err_text.contains("429")
     || err_text.contains("Too Many Requests")
     || err_text.contains("Too many requests")
   {
-    app.status_message = Some(
-      "Spotify rate limit hit. Retrying automatically; please wait a few seconds.".to_string(),
-    );
-    app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(6));
     app.instant_since_last_current_playback_poll = Instant::now();
-    return true;
+    return Some((
+      "Spotify rate limit hit. Retrying automatically; please wait a few seconds.",
+      6,
+    ));
   }
 
   if lowered.contains("error sending request for url")
@@ -432,12 +435,11 @@ fn handle_transient_playback_poll_error(app: &mut App, err_text: &str) -> bool {
     || err_text.contains("temporary failure")
     || err_text.contains("dns")
   {
-    app.status_message = Some(
-      "Temporary Spotify network error while polling playback; retrying automatically.".to_string(),
-    );
-    app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(5));
     app.instant_since_last_current_playback_poll = Instant::now();
-    return true;
+    return Some((
+      "Temporary Spotify network error while polling playback; retrying automatically.",
+      5,
+    ));
   }
 
   if err_text.contains("504")
@@ -447,14 +449,14 @@ fn handle_transient_playback_poll_error(app: &mut App, err_text: &str) -> bool {
     || err_text.contains("Service Unavailable")
     || err_text.contains("Bad Gateway")
   {
-    app.status_message =
-      Some("Spotify server temporarily unavailable (5xx); retrying automatically.".to_string());
-    app.status_message_expires_at = Some(Instant::now() + Duration::from_secs(10));
     app.instant_since_last_current_playback_poll = Instant::now();
-    return true;
+    return Some((
+      "Spotify server temporarily unavailable (5xx); retrying automatically.",
+      10,
+    ));
   }
 
-  false
+  None
 }
 
 /// While a native backend is expected to materialize (recovery in flight, or
@@ -1142,7 +1144,13 @@ impl PlaybackNetwork for Network {
 
         let err = anyhow!(e);
 
-        if handle_transient_playback_poll_error(&mut app, &err.to_string()) {
+        if let Some((message, ttl_secs)) =
+          handle_transient_playback_poll_error(&mut app, &err.to_string())
+        {
+          drop(app);
+          self
+            .show_status_message(message.to_string(), ttl_secs)
+            .await;
           return;
         }
 
@@ -3048,18 +3056,19 @@ mod tests {
       let stale_poll = Instant::now() - Duration::from_secs(60);
       app.instant_since_last_current_playback_poll = stale_poll;
 
-      assert!(
-        handle_transient_playback_poll_error(&mut app, err_text),
+      let consumed = handle_transient_playback_poll_error(&mut app, err_text);
+      assert_eq!(
+        consumed,
+        Some((
+          "Spotify session expired. Refreshing authentication automatically.",
+          5
+        )),
         "auth error {err_text:?} must be consumed before generic error handling"
       );
 
       assert!(
         matches!(io_rx.try_recv(), Ok(IoEvent::RefreshAuthentication)),
         "auth error {err_text:?} must dispatch RefreshAuthentication"
-      );
-      assert_eq!(
-        app.status_message.as_deref(),
-        Some("Spotify session expired. Refreshing authentication automatically.")
       );
       assert!(app.instant_since_last_current_playback_poll > stale_poll);
       assert!(app.api_error.is_empty());
@@ -3081,8 +3090,13 @@ mod tests {
       let stale_poll = Instant::now() - Duration::from_secs(60);
       app.instant_since_last_current_playback_poll = stale_poll;
 
-      assert!(
-        handle_transient_playback_poll_error(&mut app, err_text),
+      let consumed = handle_transient_playback_poll_error(&mut app, err_text);
+      assert_eq!(
+        consumed,
+        Some((
+          "Spotify rate limit hit. Retrying automatically; please wait a few seconds.",
+          6
+        )),
         "rate-limit error {err_text:?} must be consumed before generic error handling"
       );
 
@@ -3090,11 +3104,6 @@ mod tests {
         io_rx.try_recv().is_err(),
         "rate-limit error {err_text:?} must not dispatch any IoEvent"
       );
-      assert_eq!(
-        app.status_message.as_deref(),
-        Some("Spotify rate limit hit. Retrying automatically; please wait a few seconds.")
-      );
-      assert!(app.status_message_expires_at.is_some());
       assert!(app.instant_since_last_current_playback_poll > stale_poll);
       assert!(app.api_error.is_empty());
     }
@@ -3111,10 +3120,7 @@ mod tests {
     let (io_tx, io_rx) = channel();
     let mut app = App::new(io_tx, UserConfig::new(), Some(SystemTime::now()));
 
-    assert!(!handle_transient_playback_poll_error(
-      &mut app,
-      "some unexpected failure"
-    ));
+    assert!(handle_transient_playback_poll_error(&mut app, "some unexpected failure").is_none());
     assert!(io_rx.try_recv().is_err());
     assert!(app.status_message.is_none());
   }
